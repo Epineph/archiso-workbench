@@ -1,0 +1,8 @@
+# Filesystem recovery and hardware inspection.
+ddrescue
+ethtool
+lsof
+pciutils
+strace
+testdisk
+usbutils

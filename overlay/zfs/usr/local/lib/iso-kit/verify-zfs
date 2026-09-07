@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Verify the ISO kernel, never the build host's uname -r.
+set -Eeuo pipefail
+function fail() { printf 'ZFS validation failed: %s\n' "$*" >&2; exit 1; }
+pacman -Q zfs-dkms zfs-utils linux linux-headers
+found=0
+for directory in /usr/lib/modules/*; do
+  [[ -f $directory/pkgbase ]] || continue
+  [[ $(< "$directory/pkgbase") == linux ]] || continue
+  kernel=${directory##*/}
+  found=$((found + 1))
+  [[ -d $directory/build ]] || fail "Missing headers: $kernel"
+  depmod -a "$kernel"
+  magic="$(modinfo -k "$kernel" -F vermagic zfs)" \
+    || fail "No ZFS module for $kernel; inspect the DKMS build errors"
+  [[ $magic == "$kernel "* ]] || fail "Wrong module vermagic: $magic"
+  modprobe --set-version "$kernel" --show-depends zfs
+  printf 'Verified module and dependencies for %s\n' "$kernel"
+done
+((found == 1)) || fail "Expected one linux kernel; found $found"
+printf 'This is a build check. Loading ZFS still requires a live VM test.\n'

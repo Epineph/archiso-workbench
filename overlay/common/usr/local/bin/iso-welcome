@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cat <<'HELP'
+Archiso Workbench
+  iso-doctor                         Read-only boot/storage/network diagnostics
+  iso-config --help                  Capture or apply configuration files
+  less /opt/reinstall-kit/README.md   Offline instructions
+  ls /opt/reinstall-kit/payload       Reinstall files: home/ and system/
+
+The live system uses Arch releng networking and login behavior.
+Nothing here automatically partitions disks, imports pools, or installs an OS.
+HELP

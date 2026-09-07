@@ -1,0 +1,24 @@
+# Installed in addition to the official releng package list.
+arch-install-scripts
+bat
+btrfs-progs
+cryptsetup
+curl
+dosfstools
+e2fsprogs
+fd
+git
+gptfdisk
+jq
+less
+lvm2
+neovim
+ntfs-3g
+nvme-cli
+python
+ripgrep
+rsync
+smartmontools
+tmux
+wget
+zsh

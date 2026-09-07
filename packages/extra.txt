@@ -1,0 +1,4 @@
+# Your additional official/local package names, one per line.
+# Examples: R (the package name is r), imagemagick, pandoc-cli, texlive-xetex.
+# hyprland, kitty, pipewire etc. may be added, but this does not configure a
+# graphical login/session. NetworkManager also needs deliberate service setup.

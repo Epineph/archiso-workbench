@@ -1,0 +1,14 @@
+# Terminal-oriented development/reinstall environment (no desktop autostart).
+base-devel
+bash-completion
+btop
+fzf
+github-cli
+python-pip
+python-virtualenv
+ruff
+shellcheck
+shfmt
+starship
+unzip
+zip
