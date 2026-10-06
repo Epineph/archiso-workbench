@@ -34,7 +34,15 @@ cd archiso-workbench
 ./build-iso.sh --help
 ./build-iso.sh --preset personal             # Stage only: no ISO yet
 ./build-iso.sh --preset personal --build     # Fresh stage and actual build
+./build-iso.sh --build --cores 4             # Explicit core count
+./build-iso.sh --build -j8                   # Equivalent short form
 ```
+
+Build parallelism defaults to half the available logical CPUs reported by
+`nproc`, rounded down with a minimum of one: 8 CPUs use 4; 16 CPUs use 8.
+Override it with `--cores N` or `-jN` (also `--cores=N` and `-j N`), using a
+positive integer. This sets image compression workers and `MAKEFLAGS`, and
+limits the build and its package hooks to at most N of the available CPUs.
 
 Staging requires the installed `releng` profile, but no network or sudo when local
 packages are not used. Every invocation creates a new run. Staging and building

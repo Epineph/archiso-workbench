@@ -80,10 +80,13 @@ def main():
   for name in ('kit', 'base', 'run'):
     parser.add_argument('--' + name, required=True, type=Path)
   parser.add_argument('--preset', choices=['rescue', 'personal'], required=True)
+  parser.add_argument('--cores', type=int, help='Image compression workers')
   parser.add_argument('--snapshot')
   parser.add_argument('--local-packages', type=Path)
   parser.add_argument('--zfs', action='store_true')
   a = parser.parse_args()
+  if a.cores is not None and a.cores < 1:
+    parser.error('--cores requires a positive integer')
   if a.snapshot:
     if not re.fullmatch(r'\d{4}/\d{2}/\d{2}', a.snapshot):
       parser.error('Snapshot must be YYYY/MM/DD')
@@ -171,6 +174,14 @@ def main():
   lines = ["\n# Archiso Workbench overrides", "iso_name='heini-arch'",
            f"iso_version='{dt.datetime.now(dt.timezone.utc):%Y.%m.%d}-"
            f"{a.preset}{'-zfs' if a.zfs else ''}'", "buildmodes=('iso')"]
+  if a.cores is not None:
+    # mkarchiso has no jobs flag; configure its image tool in the staged copy.
+    lines += ['case "${airootfs_image_type:-squashfs}" in',
+              '  squashfs|ext4+squashfs)',
+              f"    airootfs_image_tool_options+=('-processors' '{a.cores}') ;;",
+              '  erofs)',
+              f"    airootfs_image_tool_options+=('--workers={a.cores}') ;;",
+              'esac']
   for p in sorted(root.rglob('*')):
     if p.is_file() and not p.is_symlink() and p.stat().st_mode & stat.S_IXUSR:
       rel = '/' + str(p.relative_to(root))
@@ -187,6 +198,7 @@ def main():
         target.unlink()
       target.symlink_to('/dev/null')
   manifest = {'preset': a.preset, 'zfs': a.zfs, 'snapshot': a.snapshot,
+              'cores': a.cores,
               'base_profile': str(a.base.resolve()), 'packages': names,
               'sha256': {}}
   for p in sorted(profile.rglob('*')):

@@ -8,7 +8,7 @@ umask 022
 KIT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 function usage() {
-  cat <<'HELP'
+  cat << 'HELP'
 Usage: ./build-iso.sh [options]
   --preset rescue|personal    Package selection (default: personal)
   --zfs                      Include zfs-dkms and zfs-utils from local packages
@@ -17,6 +17,7 @@ Usage: ./build-iso.sh [options]
   --snapshot YYYY/MM/DD       Pin ALL official repos to an explicit archive date
   --base-profile DIR         Default: /usr/share/archiso/configs/releng
   --output DIR               Parent for fresh runs (default: ./builds)
+  --cores N, -jN             Build cores (default: half of nproc, minimum 1)
   --build                    Run mkarchiso; otherwise only prepare the profile
   -h, --help                 Show this help
 
@@ -27,8 +28,17 @@ The final ISO is published only after image/package/ZFS checks pass.
 HELP
 }
 
-function die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
-function need() { command -v "$1" >/dev/null || die "Missing command: $1"; }
+function die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+function need() { command -v "$1" > /dev/null || die "Missing command: $1"; }
+
+function set_cores() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]] ||
+    die '--cores/-j requires a positive integer'
+  cores=$1
+}
 
 preset=personal
 zfs=0
@@ -36,11 +46,12 @@ build=0
 trust=0
 local_packages=''
 snapshot=''
+cores=''
 base=/usr/share/archiso/configs/releng
 output="$KIT_DIR/builds"
 while (($#)); do
   case "$1" in
-    --preset|--local-packages|--snapshot|--base-profile|--output)
+    --preset | --local-packages | --snapshot | --base-profile | --output)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --preset) preset=$2 ;;
@@ -49,14 +60,45 @@ while (($#)); do
         --base-profile) base=$2 ;;
         --output) output=$2 ;;
       esac
-      shift 2 ;;
-    --zfs) zfs=1; shift ;;
-    --build) build=1; shift ;;
-    --trust-local-packages) trust=1; shift ;;
-    -h|--help) usage; exit 0 ;;
+      shift 2
+      ;;
+    --cores | -j)
+      (($# >= 2)) || die "Missing value for $1"
+      set_cores "$2"
+      shift 2
+      ;;
+    --cores=*)
+      set_cores "${1#*=}"
+      shift
+      ;;
+    -j?*)
+      set_cores "${1#-j}"
+      shift
+      ;;
+    --zfs)
+      zfs=1
+      shift
+      ;;
+    --build)
+      build=1
+      shift
+      ;;
+    --trust-local-packages)
+      trust=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
     *) die "Unknown option: $1" ;;
   esac
 done
+if [[ -z $cores ]]; then
+  need nproc
+  cores=$(($(nproc) / 2))
+  ((cores >= 1)) || cores=1
+fi
 [[ $preset == rescue || $preset == personal ]] || die 'Invalid preset'
 ((EUID != 0)) || die 'Run as a normal user; do not sudo this wrapper'
 need python3
@@ -75,6 +117,7 @@ if ((build)); then
   need arch-chroot
   need xorriso
   need sudo
+  need taskset
   [[ $(uname -m) == x86_64 ]] || die 'An x86_64 build host is required'
   [[ -f /etc/arch-release ]] || die 'Build on Arch Linux'
 fi
@@ -84,20 +127,32 @@ output="$(realpath -- "$output")"
 run="$(mktemp -d "$output/run-XXXXXXXX")"
 # Retain incomplete runs and logs for diagnosis; never recursively clean them.
 trap 'printf "Failed at line %s. Run retained: %s\n" "$LINENO" "$run" >&2' ERR
-args=(--kit "$KIT_DIR" --base "$base" --run "$run" --preset "$preset")
+args=(--kit "$KIT_DIR" --base "$base" --run "$run" --preset "$preset"
+  --cores "$cores")
 [[ -z $snapshot ]] || args+=(--snapshot "$snapshot")
 [[ -z $local_packages ]] || args+=(--local-packages "$local_packages")
-((!zfs)) || args+=(--zfs)
+((! zfs)) || args+=(--zfs)
 python3 "$KIT_DIR/lib/stage.py" "${args[@]}"
-printf '\nPrepared profile: %s/profile\n' "$run"
+printf '\nPrepared profile: %s/profile\nBuild cores: %s\n' "$run" "$cores"
 ((build)) || exit 0
 mkdir -- "$run/candidate" "$run/out"
+cpu_list="$(
+  python3 - "$cores" << 'PY'
+import os
+import sys
+print(','.join(map(str, sorted(os.sched_getaffinity(0))[:int(sys.argv[1])])))
+PY
+)"
 # The private pacman configuration belongs to this run, never to /etc.
-sudo mkarchiso -v -m iso -C "$run/profile/pacman.conf" \
+# Affinity also limits package hooks; MAKEFLAGS controls ordinary make jobs.
+sudo taskset --cpu-list "$cpu_list" env MAKEFLAGS="-j$cores" \
+  mkarchiso -v -m iso -C "$run/profile/pacman.conf" \
   -w "$run/work" -o "$run/candidate" "$run/profile" \
   2>&1 | tee "$run/build.log"
 root="$run/work/x86_64/airootfs"
 [[ -d $root ]] || die 'Archiso root layout changed; inspect retained work'
+# The user owns this log; only the chroot command needs elevated privileges.
+# shellcheck disable=SC2024
 sudo arch-chroot "$root" pacman -Q > "$run/installed-packages.txt"
 if ((zfs)); then
   sudo arch-chroot "$root" /usr/local/lib/iso-kit/verify-zfs \
