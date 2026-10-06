@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Verify the ISO kernel, never the build host's uname -r.
 set -Eeuo pipefail
-function fail() { printf 'ZFS validation failed: %s\n' "$*" >&2; exit 1; }
-pacman -Q zfs-dkms zfs-utils linux linux-headers
+function fail() {
+  printf 'ZFS validation failed: %s\n' "$*" >&2
+  exit 1
+}
+# Only installed versions matter; Archiso has already removed sync databases.
+pacman --config /dev/null -Q zfs-dkms zfs-utils linux linux-headers
 found=0
 for directory in /usr/lib/modules/*; do
   [[ -f $directory/pkgbase ]] || continue
@@ -11,8 +15,8 @@ for directory in /usr/lib/modules/*; do
   found=$((found + 1))
   [[ -d $directory/build ]] || fail "Missing headers: $kernel"
   depmod -a "$kernel"
-  magic="$(modinfo -k "$kernel" -F vermagic zfs)" \
-    || fail "No ZFS module for $kernel; inspect the DKMS build errors"
+  magic="$(modinfo -k "$kernel" -F vermagic zfs)" ||
+    fail "No ZFS module for $kernel; inspect the DKMS build errors"
   [[ $magic == "$kernel "* ]] || fail "Wrong module vermagic: $magic"
   modprobe --set-version "$kernel" --show-depends zfs
   printf 'Verified module and dependencies for %s\n' "$kernel"

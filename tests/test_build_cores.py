@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline builder parallelism checks; no sudo or real ISO build."""
+"""Offline builder and inventory checks; no sudo or real ISO build."""
 import hashlib
 import json
 import os
@@ -91,15 +91,20 @@ class BuildCoresTests(unittest.TestCase):
         self.assertIn('Error:', result.stderr)
         self.assertFalse(output.exists())
 
-  @unittest.skipIf(os.geteuid() == 0, 'Builder requires a normal user')
-  @unittest.skipUnless(Path('/etc/arch-release').exists() and
-                       shutil.which('taskset'), 'Arch/taskset build preflight')
-  def test_build_limits_cpu_affinity_and_make_jobs(self):
+  def mock_build_commands(self):
     # Replace privileged commands; exercise the real taskset and env invocation.
     self.command('sudo', '''#!/bin/sh
 case "$1" in
   taskset) exec "$@" ;;
-  arch-chroot) printf 'linux fixture\\n' ;;
+  arch-chroot)
+    if [ -n "$TEST_PACMAN" ]; then
+      root=$2
+      shift 3
+      exec "$TEST_PACMAN" --config "$root/etc/pacman.conf" \\
+        --dbpath "$root/var/lib/pacman" "$@"
+    fi
+    printf 'linux fixture\\n'
+    ;;
   chown) exit 0 ;;
   *) exit 1 ;;
 esac
@@ -110,20 +115,53 @@ esac
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 args = sys.argv[1:]
 work = Path(args[args.index('-w') + 1])
 output = Path(args[args.index('-o') + 1])
-(work / 'x86_64/airootfs').mkdir(parents=True)
+root = work / 'x86_64/airootfs'
+(root / 'etc').mkdir(parents=True)
+shutil.copyfile(Path(args[-1]) / 'airootfs/etc/pacman.conf',
+                root / 'etc/pacman.conf')
+# Archiso retains the local database but deletes all sync databases.
+local = root / 'var/lib/pacman/local/linux-1.0-1'
+local.mkdir(parents=True)
+shutil.copyfile('/var/lib/pacman/local/ALPM_DB_VERSION',
+                local.parent / 'ALPM_DB_VERSION')
+(local / 'desc').write_text('%NAME%\\nlinux\\n\\n%VERSION%\\n1.0-1\\n')
 (output / 'fixture.iso').write_text('offline fixture')
 (work.parent / 'cpu-check.json').write_text(json.dumps({
   'cpus': sorted(os.sched_getaffinity(0)),
   'makeflags': os.environ['MAKEFLAGS']}))
 ''')
+
+  @unittest.skipIf(os.geteuid() == 0, 'Builder requires a normal user')
+  @unittest.skipUnless(Path('/etc/arch-release').exists() and
+                       shutil.which('taskset'), 'Arch/taskset build preflight')
+  def test_build_limits_cpu_affinity_and_make_jobs(self):
+    self.mock_build_commands()
+    self.env['TEST_PACMAN'] = ''
     run = self.check_profile(2, '--build', '-j2')
     observed = json.loads((run / 'cpu-check.json').read_text())
     self.assertEqual(observed['cpus'], sorted(os.sched_getaffinity(0))[:2])
     self.assertEqual(observed['makeflags'], '-j2')
+    self.assertTrue((run / 'out/fixture.iso').is_file())
+
+  @unittest.skipIf(os.geteuid() == 0, 'Builder requires a normal user')
+  @unittest.skipUnless(Path('/etc/arch-release').exists() and
+                       shutil.which('taskset') and shutil.which('pacman'),
+                       'Arch/taskset/pacman build preflight')
+  def test_inventory_without_sync_databases(self):
+    self.mock_build_commands()
+    self.env['TEST_PACMAN'] = shutil.which('pacman')
+    result, output = self.run_builder('--build', '-j2')
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertNotIn('database file', result.stderr)
+    self.assertNotIn("use '-Sy'", result.stderr)
+    run = next(output.glob('run-*'))
+    self.assertEqual((run / 'installed-packages.txt').read_text(),
+                     'linux 1.0-1\n')
     self.assertTrue((run / 'out/fixture.iso').is_file())
 
 

@@ -62,6 +62,11 @@ a candidate as a validated release. No broad cleanup or host pacman.conf changes
 are performed. The build still runs trusted packages/hooks with privileges: use a
 VM if you want stronger isolation from your ordinary host.
 
+Archiso removes downloaded repository databases before finishing the image.
+The builder's final package checks query only the installed-package database,
+so they do not need `pacman -Sy`. To install additional software after booting
+the live ISO, use `pacman -Syu` to refresh repositories and upgrade together.
+
 ## 2. ZFS packages
 
 ZFS is supplied outside Arch's official repositories. This version deliberately

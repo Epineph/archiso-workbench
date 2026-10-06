@@ -32,6 +32,29 @@ Re-run the offline tests with:
 python3 -m unittest discover -s tests -v
 ```
 
+## Build-script correction, 6 October 2026
+
+Environment confirmed as x86_64 Arch Linux, with Archiso 91 and pacman 7.1.
+Removed the broken post-build unofficial repository setup; retained the user's
+personal package additions. Post-build inventory and ZFS package queries now use
+`pacman --config /dev/null -Q` to avoid opening deleted sync databases.
+
+Verification performed:
+
+- All 12 offline regression tests passed. The new inventory regression uses real
+  pacman against a synthetic local database with no sync databases; privileged
+  commands and ISO creation are mocked.
+- Staged the installed releng profile successfully: 177 requested packages.
+- All requested packages resolved through official repositories using the host's
+  cached metadata (`pacman -Sp`); no databases were refreshed or packages installed.
+- Bash syntax, ShellCheck, shfmt, Ruff, and `git diff --check` passed for the
+  relevant changed files. Authored script lines stay within 82 columns.
+- A query against a retained real build returned the same 685 installed packages
+  with and without the fix; the fixed query emitted no missing-database warnings.
+
+No new privileged ISO build, ZFS compilation, or VM boot was performed in this
+correction. Those checks remain required below.
+
 ## Required on the build/test host
 
 - Real current releng profile staging and dependency resolution.

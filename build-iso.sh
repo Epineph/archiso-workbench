@@ -151,9 +151,12 @@ sudo taskset --cpu-list "$cpu_list" env MAKEFLAGS="-j$cores" \
   2>&1 | tee "$run/build.log"
 root="$run/work/x86_64/airootfs"
 [[ -d $root ]] || die 'Archiso root layout changed; inspect retained work'
+# Archiso removes sync databases before compression. Query installed packages
+# without configured repositories; missing sync caches do not require a refresh.
 # The user owns this log; only the chroot command needs elevated privileges.
 # shellcheck disable=SC2024
-sudo arch-chroot "$root" pacman -Q > "$run/installed-packages.txt"
+sudo arch-chroot "$root" pacman --config /dev/null -Q \
+  > "$run/installed-packages.txt"
 if ((zfs)); then
   sudo arch-chroot "$root" /usr/local/lib/iso-kit/verify-zfs \
     2>&1 | tee "$run/zfs-check.log"
