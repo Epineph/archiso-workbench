@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Read-only installation diagnostics; no disks/pools are opened for writing.
+set -Eeuo pipefail
+function section() { printf '\n%s\n' "$*"; }
+if [[ ${1:-} == --help ]]; then
+  printf 'Usage: iso-doctor\nReports boot mode, disks, network and ZFS.\n'
+  exit 0
+fi
+section 'Boot mode and kernel'
+if [[ -d /sys/firmware/efi ]]; then echo UEFI; else echo BIOS; fi
+uname -r
+section 'Disks and mounts'
+lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS
+findmnt -r -o TARGET,SOURCE,FSTYPE
+section 'Network'
+ip -brief address
+section 'ZFS module for the running kernel'
+if command -v zfs >/dev/null; then
+  modinfo -F version zfs || true
+  lsmod | rg '^zfs\b' || true
+else
+  printf 'ZFS is not installed in this image.\n'
+fi

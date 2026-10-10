@@ -72,7 +72,8 @@ the live ISO, use `pacman -Syu` to refresh repositories and upgrade together.
 ZFS is supplied outside Arch's official repositories. This version deliberately
 accepts **reviewed local `zfs-dkms` and `zfs-utils` package archives**, instead of
 silently trusting a third-party repository or building remote scripts unattended.
-It adds the ISO's `linux-headers`, DKMS, and build tools to the image.
+It adds the ISO's `linux-headers`, DKMS, build tools, and ZFS runtime libraries
+to the image. Source recipe directories are not package archives.
 
 Obtain the current AUR recipes for `zfs-utils` and `zfs-dkms`, inspect their
 PKGBUILDs, install files, patches, source URLs and signature checks, and build them
@@ -84,6 +85,39 @@ git clone https://aur.archlinux.org/zfs-dkms.git
 less zfs-utils/PKGBUILD
 less zfs-dkms/PKGBUILD
 ```
+
+The builder can build those reviewed recipes in a fresh clean chroot. Install
+Arch's `devtools` alongside the build-host dependencies above. Put the reviewed
+checkouts under `packages/zfs-utils` and `packages/zfs-dkms`, or specify their
+parent with `--zfs-sources DIR`. Keep their `.SRCINFO` files with the recipes.
+Then run:
+
+```bash
+./build-iso.sh --preset personal --build-zfs-packages \
+  --trust-local-packages --build
+```
+
+`--build-zfs-packages` implies `--zfs` and requires `--build`. It builds the
+utilities first, supplies their archive to the DKMS package's clean chroot,
+and keeps both archives in the fresh run's `zfs-packages/` directory. It does
+not install ZFS into the host system. Source signatures remain required; missing
+signer keys must be verified and supplied to your normal user's GPG keyring
+before building. Recipe build logs and chroots are retained on failure.
+
+To preview or build only the packages:
+
+```bash
+./bin/build-zfs-packages.sh --sources ./packages \
+  --output ./local-packages --work ./zfs-package-build
+# Add --build to execute the preview. Use fresh output/work paths.
+```
+
+The helper and integrated builder accept `--cores N` and `--snapshot YYYY/MM/DD`.
+An integrated snapshot applies to package compilation and the ISO's official
+repositories. Both ZFS recipes must describe the same OpenZFS release. Build
+each helper invocation in fresh output/work directories; existing runs are kept.
+
+Alternatively, supply package archives built separately:
 
 After reviewing all referenced files, use `makepkg -s` in each checkout. Resolve
 any AUR-only dependencies deliberately. If the second recipe requires the built
@@ -106,6 +140,8 @@ mkdir -p local-packages
 Every package archive in that directory is installed, so do not point this option
 at your entire pacman cache. Only `.pkg.tar.zst` is supported. Multiple versions
 of the same package are rejected. Include required local dependencies too.
+The builder checks archive metadata, x86_64 compatibility, matching ZFS releases,
+and version constraints declared by `zfs-dkms` before building the image.
 
 `--trust-local-packages` explicitly allows unsigned archives in the run's local
 repository. It does **not** disable official package signatures or trust unknown
@@ -117,7 +153,9 @@ The live pacman.conf has no broken reference to this host-only repository.
 
 DKMS is not a guarantee that a new Linux kernel is supported by a given ZFS
 release. After building, the wrapper checks the ISO's installed `linux` kernel,
-matching headers, ZFS module vermagic, and module dependency resolution. It never
+matching header versions, ZFS module vermagic, and existing module dependency
+indexes. The final checks are read-only and do not run `depmod` after compression.
+The DKMS package hook builds the modules and indexes during installation. It never
 uses the build host's `uname -r` as the target kernel. A DKMS failure can survive
 pacman's post-transaction phase; the additional check prevents publication of
 that candidate. It does not prove that the module will load or operate correctly.
@@ -137,6 +175,18 @@ official repositories in the profile and live system. A date inferred from an
 HTML directory listing is not a compatibility check. Current archiso itself may
 also be incompatible with sufficiently old snapshots. This tool does not claim
 bit-for-bit reproducible builds or support arbitrary historical dates.
+
+### Installing ZFS into a target system
+
+`--zfs` installs ZFS in the live image. For installation into a mounted target,
+copy the reviewed archives to that system and install them with `pacman -U`
+inside its chroot, after installing DKMS, build tools, runtime libraries and the
+headers matching the **target** kernel. For the `linux` kernel, those official
+packages are `linux-headers base-devel dkms libaio libtirpc openssl zlib`.
+The integrated build retains the archives under `run-*/zfs-packages/`; the local
+repository path on the build host is not included in the live pacman config.
+Target bootloader, initramfs and root-on-ZFS setup remain separate installation
+steps. See the [OpenZFS Arch guide](https://openzfs.github.io/openzfs-docs/Getting%20Started/Arch%20Linux/index.html).
 
 This release retains the standard `linux` kernel and upstream boot references.
 It does not implement a kernel switch to `linux-lts`; that requires corresponding

@@ -6,12 +6,11 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import os
-from pathlib import Path
 import re
 import shutil
 import stat
 import subprocess
+from pathlib import Path
 
 
 # -- Overlay validation --------------------------------------------------------
@@ -74,6 +73,65 @@ def put(path: Path, text: str):
   path.write_text(text)
 
 
+# -- Local archive validation --------------------------------------------------
+def checked_archives(directory: Path, zfs: bool):
+  """Check artifacts and ZFS version pins before assembling the profile."""
+  if not directory.is_dir():
+    raise ValueError(f'Local package directory does not exist: {directory}')
+  result = []
+  seen = {}
+  for path in sorted(directory.resolve().glob('*.pkg.tar.zst')):
+    if path.is_symlink() or not path.is_file():
+      raise ValueError(f'Package must be a regular file: {path}')
+    info = subprocess.check_output(['pacman', '-Qp', str(path)], text=True)
+    name, version = info.strip().split()
+    if name in seen:
+      raise ValueError(f'Multiple versions of local package: {name}')
+    raw = subprocess.check_output(
+      ['bsdtar', '-xOf', str(path), '.PKGINFO'], text=True)
+    metadata = {}
+    for line in raw.splitlines():
+      key, separator, value = line.partition(' = ')
+      if separator:
+        metadata.setdefault(key, []).append(value)
+    if metadata.get('pkgname') != [name] or metadata.get('pkgver') != [version]:
+      raise ValueError(f'Inconsistent package metadata: {path}')
+    if metadata.get('arch') not in [['any'], ['x86_64']]:
+      raise ValueError(f'Local package is not for x86_64: {path}')
+    signature = Path(str(path) + '.sig')
+    if signature.is_symlink() or (signature.exists() and
+                                  not signature.is_file()):
+      raise ValueError(f'Signature must be a regular file: {signature}')
+    seen[name] = (version, metadata)
+    result.append((path, name))
+  if not result:
+    raise ValueError('No *.pkg.tar.zst archives found; PKGBUILDs must be built '
+                     'first (see bin/build-zfs-packages.sh --help)')
+  if zfs:
+    if not {'zfs-dkms', 'zfs-utils'} <= seen.keys():
+      raise ValueError('Supply both zfs-dkms and zfs-utils archives')
+    dkms_version, dkms_info = seen['zfs-dkms']
+    utils_version = seen['zfs-utils'][0]
+    # Package releases may differ; the upstream OpenZFS release must match.
+    releases = [v.split(':')[-1].rsplit('-', 1)[0]
+                for v in [dkms_version, utils_version]]
+    if releases[0] != releases[1]:
+      raise ValueError('zfs-dkms and zfs-utils must use the same ZFS release')
+    for dependency in dkms_info.get('depend', []):
+      match = re.fullmatch(r'zfs-utils([<>]=?|=)(.+)', dependency)
+      if match:
+        operator, required = match.groups()
+        comparison = int(subprocess.check_output(
+          ['vercmp', utils_version, required], text=True))
+        valid = {'=': comparison == 0, '>': comparison > 0,
+                 '<': comparison < 0, '>=': comparison >= 0,
+                 '<=': comparison <= 0}[operator]
+        if not valid:
+          raise ValueError(f'zfs-utils {utils_version} does not satisfy '
+                           f'{dependency}')
+  return result
+
+
 # -- Profile assembly ----------------------------------------------------------
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
@@ -87,6 +145,10 @@ def main():
   a = parser.parse_args()
   if a.cores is not None and a.cores < 1:
     parser.error('--cores requires a positive integer')
+  if a.zfs and not a.local_packages:
+    parser.error('--zfs requires built --local-packages archives')
+  local_archives = (checked_archives(a.local_packages, a.zfs)
+                    if a.local_packages else [])
   if a.snapshot:
     if not re.fullmatch(r'\d{4}/\d{2}/\d{2}', a.snapshot):
       parser.error('Snapshot must be YYYY/MM/DD')
@@ -116,7 +178,10 @@ def main():
     names += package_list(a.kit / f'packages/{name}.txt')
   names += package_list(a.kit / 'packages/extra.txt')
   if a.zfs:
-    names += ['linux-headers', 'base-devel', 'dkms', 'zfs-dkms', 'zfs-utils']
+    # Some AUR recipes omit runtime dependencies. Include the userspace
+    # libraries explicitly so rescue images do not depend on preset extras.
+    names += ['linux-headers', 'base-devel', 'dkms', 'zfs-dkms', 'zfs-utils',
+              'libaio', 'libtirpc', 'openssl', 'zlib']
 
   # Use only official repos plus explicitly supplied local artifacts.
   # Never borrow third-party repos, IgnorePkg, or credentials from the host.
@@ -133,25 +198,13 @@ def main():
   if a.local_packages:
     repo = a.run / 'repo'
     repo.mkdir()
-    seen = set()
-    for p in sorted(a.local_packages.resolve().glob('*.pkg.tar.zst')):
-      if p.is_symlink() or not p.is_file():
-        raise ValueError(f'Package must be a regular file: {p}')
-      info = subprocess.check_output(['pacman', '-Qp', str(p)], text=True)
-      name, version = info.strip().split()
-      if name in seen:
-        raise ValueError(f'Multiple versions of local package: {name}')
-      seen.add(name)
+    for p, name in local_archives:
       names.append(name)
       dest = repo / p.name
       shutil.copy2(p, dest)
       if Path(str(p) + '.sig').exists():
         shutil.copy2(str(p) + '.sig', str(dest) + '.sig')
       archives.append(str(dest))
-    if not archives:
-      raise ValueError('No *.pkg.tar.zst packages found')
-    if a.zfs and not {'zfs-dkms', 'zfs-utils'} <= seen:
-      raise ValueError('Supply both zfs-dkms and zfs-utils archives')
     subprocess.run(['repo-add', str(repo / 'iso-local.db.tar.gz'),
                     *archives], check=True)
     # Optional permits unsigned locally-built artifacts, but does not trust
@@ -172,8 +225,8 @@ def main():
   # Archiso deliberately normalizes modes; executable additions need explicit
   # file_permissions entries, including scripts carried only as payload.
   lines = ["\n# Archiso Workbench overrides", "iso_name='heini-arch'",
-           f"iso_version='{dt.datetime.now(dt.timezone.utc):%Y.%m.%d}-"
-           f"{a.preset}{'-zfs' if a.zfs else ''}'", "buildmodes=('iso')"]
+           (f"iso_version='{dt.datetime.now(dt.UTC):%Y.%m.%d}-"
+            f"{a.preset}{'-zfs' if a.zfs else ''}'"), "buildmodes=('iso')"]
   if a.cores is not None:
     # mkarchiso has no jobs flag; configure its image tool in the staged copy.
     lines += ['case "${airootfs_image_type:-squashfs}" in',

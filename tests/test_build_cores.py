@@ -97,6 +97,10 @@ class BuildCoresTests(unittest.TestCase):
 case "$1" in
   taskset) exec "$@" ;;
   arch-chroot)
+    if [ "$3" = /usr/local/lib/iso-kit/verify-zfs ]; then
+      printf 'fixture ZFS verification\\n'
+      exit "${TEST_ZFS_CHECK_EXIT:-0}"
+    fi
     if [ -n "$TEST_PACMAN" ]; then
       root=$2
       shift 3
@@ -147,6 +151,98 @@ shutil.copyfile('/var/lib/pacman/local/ALPM_DB_VERSION',
     self.assertEqual(observed['cpus'], sorted(os.sched_getaffinity(0))[:2])
     self.assertEqual(observed['makeflags'], '-j2')
     self.assertTrue((run / 'out/fixture.iso').is_file())
+
+  def mock_zfs_package_helper(self):
+    # Dispatch the real wrapper normally, replacing only its package helper.
+    # Archives are real; staging uses the host's pacman and repo-add offline.
+    self.command('bash', '''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+if Path(sys.argv[1]).name != 'build-zfs-packages.sh':
+  os.execv('/usr/bin/bash', ['/usr/bin/bash', *sys.argv[1:]])
+if os.environ.get('TEST_ZFS_PACKAGES_EXIT'):
+  sys.exit(int(os.environ['TEST_ZFS_PACKAGES_EXIT']))
+args = sys.argv[2:]
+output = Path(args[args.index('--output') + 1])
+output.mkdir()
+(output.parent / 'package-args.json').write_text(json.dumps(args))
+metadata = output.parent / '.PKGINFO'
+for name in ['zfs-utils', 'zfs-dkms']:
+  text = (f'pkgname = {name}\\npkgbase = {name}\\npkgver = 2.4.4-1\\n'
+          'pkgdesc = Test fixture\\narch = any\\nsize = 1\\n'
+          'builddate = 1\\npackager = Test\\n')
+  if name == 'zfs-dkms':
+    text += 'depend = zfs-utils=2.4.4\\n'
+  metadata.write_text(text)
+  subprocess.run(['bsdtar', '--zstd', '-cf',
+                  str(output / f'{name}-2.4.4-1-any.pkg.tar.zst'),
+                  '-C', str(metadata.parent), '.PKGINFO'], check=True)
+metadata.unlink()
+''')
+
+  @unittest.skipIf(os.geteuid() == 0, 'Builder requires a normal user')
+  @unittest.skipUnless(Path('/etc/arch-release').exists() and
+                       all(shutil.which(c) for c in
+                           ['taskset', 'pacman', 'repo-add', 'bsdtar',
+                            'vercmp']), 'Arch local package tooling')
+  def test_integrated_zfs_build_and_failed_validation(self):
+    self.mock_build_commands()
+    self.mock_zfs_package_helper()
+    self.env['TEST_PACMAN'] = ''
+    options = ['--build-zfs-packages', '--trust-local-packages', '--build',
+               '--zfs-sources', str(self.root / 'recipes'),
+               '--snapshot', '2026/01/01', '-j2']
+    result, output = self.run_builder(*options)
+    self.assertEqual(result.returncode, 0, result.stderr)
+    run = next(output.glob('run-*'))
+    args = json.loads((run / 'package-args.json').read_text())
+    self.assertEqual(args[args.index('--snapshot') + 1], '2026/01/01')
+    self.assertEqual(args[args.index('--cores') + 1], '2')
+    self.assertEqual(args[args.index('--sources') + 1],
+                     str(self.root / 'recipes'))
+    self.assertIn('--build', args)
+    self.assertTrue(json.loads((run / 'manifest.json').read_text())['zfs'])
+    self.assertTrue((run / 'out/fixture.iso').exists())
+    self.assertIn('fixture ZFS verification',
+                  (run / 'zfs-check.log').read_text())
+    self.env['TEST_ZFS_CHECK_EXIT'] = '1'
+    result, output = self.run_builder(*options)
+    self.assertNotEqual(result.returncode, 0)
+    run = next(output.glob('run-*'))
+    self.assertTrue((run / 'candidate/fixture.iso').exists())
+    self.assertFalse((run / 'out/fixture.iso').exists())
+    self.assertFalse((run / 'out/SHA256SUMS').exists())
+
+  @unittest.skipIf(os.geteuid() == 0, 'Builder requires a normal user')
+  @unittest.skipUnless(Path('/etc/arch-release').exists() and
+                       all(shutil.which(c) for c in
+                           ['taskset', 'pacman', 'repo-add', 'bsdtar',
+                            'vercmp']), 'Arch local package tooling')
+  def test_failed_zfs_package_build_stops_before_staging(self):
+    self.mock_build_commands()
+    self.mock_zfs_package_helper()
+    self.env['TEST_ZFS_PACKAGES_EXIT'] = '9'
+    result, output = self.run_builder('--build-zfs-packages',
+                                      '--trust-local-packages', '--build')
+    self.assertNotEqual(result.returncode, 0)
+    run = next(output.glob('run-*'))
+    self.assertTrue((run / 'zfs-packages.log').exists())
+    self.assertFalse((run / 'profile').exists())
+    self.assertFalse((run / 'work').exists())
+
+  def test_invalid_zfs_options_create_no_build(self):
+    for options in [['--zfs'], ['--build-zfs-packages'],
+                    ['--build-zfs-packages', '--build'],
+                    ['--build-zfs-packages', '--build',
+                     '--trust-local-packages', '--local-packages', 'unused']]:
+      with self.subTest(options=options):
+        result, output = self.run_builder(*options)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Error:', result.stderr)
+        self.assertFalse(output.exists())
 
   @unittest.skipIf(os.geteuid() == 0, 'Builder requires a normal user')
   @unittest.skipUnless(Path('/etc/arch-release').exists() and

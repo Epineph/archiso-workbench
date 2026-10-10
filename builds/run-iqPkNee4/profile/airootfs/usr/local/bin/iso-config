@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Capture selected home files or preview/apply a reinstall payload.
+
+Examples:
+  iso-config capture --payload ./payload --path .config/hypr
+  iso-config apply --target /mnt --user heini
+  iso-config apply --target /mnt --user heini --apply --overwrite
+
+Capture does not recurse into arbitrary home directories unless selected.
+Apply defaults to a dry run; --overwrite backs up existing files first.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import tempfile
+
+BLOCKED = {'.ssh', '.gnupg', '.aws', '.azure', '.kube', '.git', '.env',
+           'auth.json', '.netrc', '.npmrc', '.pypirc', 'shadow', 'gshadow',
+           'machine-id', 'zpool.cache', 'credentials', 'keyfiles'}
+
+
+def guard(path: Path):
+  """Refuse symlinks at every existing path component, not just at the leaf."""
+  for part in [path, *path.parents]:
+    if part.is_symlink():
+      raise ValueError(f'Refusing symlink: {part}')
+
+
+def inspect(path: Path):
+  guard(path)
+  if not path.is_file():
+    raise ValueError(f'Not a regular file: {path}')
+  if any(p in BLOCKED or p.endswith(('.key', '.pem')) for p in path.parts):
+    raise ValueError(f'Possible credentials/identity: {path}')
+  if path.stat().st_size > 16 * 1024 * 1024:
+    raise ValueError(f'File exceeds 16 MiB: {path}')
+  data = path.read_bytes()
+  if b'PRIVATE KEY-----' in data:
+    raise ValueError(f'Private key: {path}')
+
+
+def tree_files(path: Path):
+  guard(path)
+  if path.is_file():
+    return [path]
+  if not path.is_dir():
+    raise ValueError(f'No such file or directory: {path}')
+  result = []
+  for p in sorted(path.rglob('*')):
+    guard(p)
+    if p.is_dir():
+      continue
+    inspect(p)
+    result.append(p)
+  return result
+
+
+def capture(a):
+  if os.geteuid() == 0:
+    raise ValueError('Capture as your normal user, not root')
+  source = Path(a.source_home).absolute()
+  dest = a.payload.absolute() / 'home'
+  jobs = {}
+  for item in a.path:
+    rel = Path(item)
+    if rel.is_absolute() or '..' in rel.parts or rel == Path('.'):
+      raise ValueError('Select explicit relative home paths; not the whole home')
+    for p in tree_files(source / rel):
+      inspect(p)
+      q = dest / p.relative_to(source)
+      guard(q)
+      if q.exists():
+        raise ValueError(f'Destination exists; review/remove it first: {q}')
+      jobs[q] = p
+  for q, p in jobs.items():
+    q.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(p, q)
+    print(f'Captured: {p.relative_to(source)}')
+  print('Review captured contents manually: credential detection is incomplete.')
+
+
+def apply(a):
+  target = a.target.absolute()
+  if '..' in target.parts:
+    raise ValueError('Parent traversal is not allowed in the target path')
+  guard(target)
+  if target == Path('/') or not (target / 'etc/arch-release').is_file():
+    raise ValueError('Target must be a mounted Arch installation, never /')
+  if not os.path.ismount(target):
+    raise ValueError('Target must be a mount point, e.g. /mnt')
+  if a.scope == 'home':
+    if not a.user:
+      raise ValueError('--user is required for home files')
+    lines = (target / 'etc/passwd').read_text().splitlines()
+    entries = [s.split(':') for s in lines]
+    users = [e for e in entries if len(e) == 7 and e[0] == a.user]
+    if len(users) != 1:
+      raise ValueError('Create the requested user in the target first')
+    entry = users[0]
+    uid, gid = int(entry[2]), int(entry[3])
+    home = Path(entry[5])
+    if (uid == 0 or not home.is_absolute() or '..' in home.parts
+        or home == Path('/')):
+      raise ValueError('User must be non-root with a valid absolute home')
+    dest = target / home.relative_to('/')
+    guard(dest)
+    if not dest.is_dir():
+      raise ValueError('Create/mount the target home first')
+  else:
+    uid = gid = 0
+    dest = target
+  src = a.payload.absolute() / a.scope
+  jobs = []
+  for p in tree_files(src):
+    inspect(p)
+    q = dest / p.relative_to(src)
+    guard(q)
+    if q.exists() and not q.is_file():
+      raise ValueError(f'Destination is not a regular file: {q}')
+    if q.exists() and p.read_bytes() == q.read_bytes():
+      print(f'Unchanged: {q}')
+      continue
+    if q.exists() and not a.overwrite:
+      raise ValueError(f'Existing file: {q}; use --overwrite for backup/copy')
+    jobs.append((p, q))
+    print(f'{"Replace" if q.exists() else "Create"}: {q}')
+  if not a.apply:
+    print('Preview only. Add --apply to copy; --overwrite permits replacements.')
+    return
+  if os.geteuid() != 0:
+    raise ValueError('Applying requires root to set target ownership')
+  if not jobs:
+    return
+  backup_parent = target / 'var/backups/iso-kit'
+  guard(backup_parent)
+  backup_parent.mkdir(parents=True, exist_ok=True)
+  backup = Path(tempfile.mkdtemp(prefix='apply-', dir=backup_parent))
+  records = []
+  for p, q in jobs:
+    guard(q)
+    relative = str(q.relative_to(target))
+    existed = q.exists()
+    if existed:
+      b = backup / 'files' / relative
+      b.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(q, b)
+      os.chown(b, q.stat().st_uid, q.stat().st_gid)
+    records.append({'path': relative, 'existed': existed,
+                    'new_sha256': hashlib.sha256(p.read_bytes()).hexdigest()})
+    # Journal before writing, so an interrupted run retains restoration context.
+    (backup / 'manifest.json').write_text(json.dumps(records, indent=2) + '\n')
+    missing = []
+    parent = q.parent
+    while not parent.exists():
+      missing.append(parent)
+      parent = parent.parent
+    for directory in reversed(missing):
+      directory.mkdir(mode=0o755)
+      os.chown(directory, uid, gid)
+    fd, tmp = tempfile.mkstemp(prefix='.iso-kit-', dir=q.parent)
+    os.close(fd)
+    try:
+      shutil.copyfile(p, tmp)
+      os.chmod(tmp, 0o755 if p.stat().st_mode & stat.S_IXUSR else 0o644)
+      os.chown(tmp, uid, gid)
+      os.replace(tmp, q)
+    finally:
+      if os.path.exists(tmp):
+        os.unlink(tmp)
+  print(f'Applied {len(jobs)} files. Backup and journal: {backup}')
+
+
+def main():
+  p = argparse.ArgumentParser(
+    description=__doc__,
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+  sub = p.add_subparsers(dest='command', required=True)
+  c = sub.add_parser('capture', help='Copy selected non-secret home files')
+  c.add_argument('--payload', type=Path, required=True)
+  c.add_argument('--source-home', default=str(Path.home()))
+  c.add_argument('--path', action='append', required=True)
+  c.set_defaults(func=capture)
+  d = sub.add_parser('apply', help='Preview/copy to a mounted installation')
+  d.add_argument('--payload', type=Path,
+                 default=Path('/opt/reinstall-kit/payload'))
+  d.add_argument('--target', type=Path, required=True)
+  d.add_argument('--user')
+  d.add_argument('--scope', choices=['home', 'system'], default='home')
+  d.add_argument('--apply', action='store_true')
+  d.add_argument('--overwrite', action='store_true')
+  d.set_defaults(func=apply)
+  a = p.parse_args()
+  a.func(a)
+
+
+if __name__ == '__main__':
+  try:
+    main()
+  except (OSError, ValueError) as exc:
+    raise SystemExit(f'Error: {exc}')

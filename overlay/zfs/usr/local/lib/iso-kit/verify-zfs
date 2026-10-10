@@ -1,24 +1,56 @@
 #!/usr/bin/env bash
 # Verify the ISO kernel, never the build host's uname -r.
+# Read-only: these module indexes have already been compressed into the ISO.
 set -Eeuo pipefail
 function fail() {
   printf 'ZFS validation failed: %s\n' "$*" >&2
   exit 1
 }
+root=/
+while (($#)); do
+  case "$1" in
+    --root)
+      (($# >= 2)) || fail 'Missing value for --root'
+      [[ -d $2 && $2 == /* ]] || fail '--root needs an absolute directory'
+      root=${2%/}
+      [[ -n $root ]] || root=/
+      shift 2
+      ;;
+    -h | --help)
+      printf 'Usage: verify-zfs [--root DIR]\nRead-only ISO module checks.\n'
+      exit 0
+      ;;
+    *) fail "Unknown option: $1" ;;
+  esac
+done
 # Only installed versions matter; Archiso has already removed sync databases.
-pacman --config /dev/null -Q zfs-dkms zfs-utils linux linux-headers
+packages="$(pacman --root "$root" --config /dev/null -Q \
+  zfs-dkms zfs-utils linux linux-headers)" || fail 'Missing required packages'
+printf '%s\n' "$packages"
+linux_version=''
+headers_version=''
+while read -r package version; do
+  case "$package" in
+    linux) linux_version=$version ;;
+    linux-headers) headers_version=$version ;;
+  esac
+done <<< "$packages"
+[[ -n $linux_version && $linux_version == "$headers_version" ]] ||
+  fail 'linux and linux-headers versions differ'
 found=0
-for directory in /usr/lib/modules/*; do
+for directory in "$root"/usr/lib/modules/*; do
   [[ -f $directory/pkgbase ]] || continue
   [[ $(< "$directory/pkgbase") == linux ]] || continue
   kernel=${directory##*/}
   found=$((found + 1))
   [[ -d $directory/build ]] || fail "Missing headers: $kernel"
-  depmod -a "$kernel"
-  magic="$(modinfo -k "$kernel" -F vermagic zfs)" ||
+  [[ -s $directory/modules.dep && -s $directory/modules.dep.bin ]] ||
+    fail "Missing module dependency indexes: $kernel; inspect DKMS hooks"
+  magic="$(modinfo -b "$root" -k "$kernel" -F vermagic zfs)" ||
     fail "No ZFS module for $kernel; inspect the DKMS build errors"
   [[ $magic == "$kernel "* ]] || fail "Wrong module vermagic: $magic"
-  modprobe --set-version "$kernel" --show-depends zfs
+  modprobe --dirname "$root" --set-version "$kernel" --show-depends zfs ||
+    fail "Unresolved ZFS module dependencies: $kernel"
   printf 'Verified module and dependencies for %s\n' "$kernel"
 done
 ((found == 1)) || fail "Expected one linux kernel; found $found"
